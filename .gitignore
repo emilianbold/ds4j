@@ -1,0 +1,7 @@
+target/
+build/
+nohup.out
+*.log
+.DS_Store
+# the 81 GB model must never be committed
+ds4flash.gguf
