@@ -39,3 +39,26 @@ One-shot CLI instead of the server:
 OpenAI-compatible endpoints: `/v1/models`, `/v1/chat/completions`
 (streaming + tools), `/v1/completions`, plus Anthropic `/v1/messages`.
 Seeded requests reproduce the C engine's sampled tokens exactly.
+
+## Performance
+
+M5 Max 128 GB, DeepSeek V4 Flash Q2, context 16384, engine-level timing
+(no HTTP): fresh prefill of exactly N tokens of `speed-bench/promessi_sposi.txt`,
+then 128 greedy decode tokens — the `ds4-bench` methodology. C = `ds4-bench`
+from antirez/ds4 main (Oct 2026); ds4j = the same loop over `Engine`.
+Runs alternated with cool-down pauses (the GPU throttles ~10% after a few
+minutes of sustained load).
+
+| prompt tokens | prefill t/s C | prefill t/s ds4j | decode t/s C | decode t/s ds4j |
+|--------------:|--------------:|-----------------:|-------------:|----------------:|
+| 1024 | 725 | 754 | 46.7 | 43.5 |
+| 4096 | 788 | 818 | 42.2 | 40.2 |
+| 4124 | 751 | 785 | 42.1 | 40.2 |
+| 8192 | 727 | 761 | 41.3 | 40.1 |
+| 8355 | 699 | 740 | 41.4 | 40.3 |
+
+4124 and 8355 are the realistic case: prompts that leave a short ragged
+chunk after the 4096-token chunks (both engines lose ~4–5% on it).
+
+ds4j prefills 4–6% faster than the C engine and decodes 3–7% slower
+(0.7–1.6 ms per token).
