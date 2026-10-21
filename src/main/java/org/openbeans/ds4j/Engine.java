@@ -1087,11 +1087,32 @@ public final class Engine {
                     tl.args(tl.COPY_ROWS_F32).i(n).i(compWidth),
                     Tl.B.b(dbgCompSc, 0), Tl.B.b(pfCompSc, 0));
             if (perToken) {
-                // C parity: an unaligned nonzero-prefix chunk runs the
-                // incremental per-token state machine, not the batch pool
-                compressorPerToken(bb, il, pos0, n, l.compApe, ape16, l.compNorm,
-                        nHeadDim, attnStateKv[il], attnStateScore[il], true,
-                        freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                int headN = pos0 % 4 == 0 ? (n / 4) * 4 : 0;
+                if (headN > 0) {
+                    // Batch the aligned head through the replay and run the
+                    // incremental per-token state machine only for the ragged
+                    // remainder (< 4 tokens: it can never complete a pooling
+                    // window, so it only stores state rows). Mirrors the C
+                    // fix: running a whole ragged tail chunk per token costs
+                    // ~5 tiny dispatches per layer per token.
+                    compressorReplayR4(bb, attnCompStage, 0, attnStateKv[il], attnStateScore[il],
+                            l.compApe, ape16, l.compNorm, nHeadDim, pos0, headN, true,
+                            freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                    commitCompStage(bb, il, compBefore, nCompChunk);
+                    nComp[il] = compBefore + nCompChunk;
+                    refreshR4State(bb, attnStateKv[il], attnStateScore[il], l.compKv, l.compGate,
+                            l.compApe, ape16, nHeadDim, compWidth, pos0, headN);
+                    compressorPerToken(bb, il, pos0, headN, n, l.compApe, ape16, l.compNorm,
+                            nHeadDim, attnStateKv[il], attnStateScore[il], true,
+                            freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                } else {
+                    // C parity: an unaligned-start nonzero-prefix chunk runs
+                    // the incremental per-token state machine, not the batch
+                    // pool
+                    compressorPerToken(bb, il, pos0, 0, n, l.compApe, ape16, l.compNorm,
+                            nHeadDim, attnStateKv[il], attnStateScore[il], true,
+                            freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                }
             } else if (zeroPrefix || ratio != 4 || !aligned) {
                 compressorPrefillBatch(bb, zeroPrefix, attnCompStage, attnStateKv[il], attnStateScore[il],
                         0, l.compApe, ape16, l.compNorm, nHeadDim, ratio, pos0, n, true,
@@ -1133,9 +1154,36 @@ public final class Engine {
             int idxBefore = nIndexComp[il];
             boolean idxPerToken = !zeroPrefix && !aligned;
             if (idxPerToken) {
-                compressorPerToken(bb, il, pos0, n, l.idxCompApe, ape16, l.idxCompNorm,
-                        idxDim, idxStateKv[il], idxStateScore[il], false,
-                        freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                int idxHeadN = pos0 % 4 == 0 ? (n / 4) * 4 : 0;
+                if (idxHeadN > 0) {
+                    // Same head/remainder split as the attention compressor
+                    // above: replay-batch the aligned head (pool + hadamard
+                    // its rows), refresh the state from the head's last four
+                    // tokens, then store the ragged remainder per token (it
+                    // can never complete a pooling window).
+                    compressorReplayR4(bb, idxCompCache[il], (long) idxBefore * idxDim * 4,
+                            idxStateKv[il], idxStateScore[il],
+                            l.idxCompApe, ape16, l.idxCompNorm, idxDim, pos0, idxHeadN, false,
+                            freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                    if (idxChunk > 0) {
+                        tl.launch(bb, tl.INDEXER_HADAMARD, idxChunk, 1, 1,
+                                tl.args(tl.INDEXER_HADAMARD).i(idxDim).i(idxChunk),
+                                Tl.B.b(idxCompCache[il], (long) idxBefore * idxDim * 4));
+                    }
+                    nIndexComp[il] = idxBefore + idxChunk;
+                    refreshR4State(bb, idxStateKv[il], idxStateScore[il], l.idxCompKv, l.idxCompGate,
+                            l.idxCompApe, ape16, idxDim, indexWidth, pos0, idxHeadN);
+                    compressorPerToken(bb, il, pos0, idxHeadN, n, l.idxCompApe, ape16, l.idxCompNorm,
+                            idxDim, idxStateKv[il], idxStateScore[il], false,
+                            freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                } else {
+                    // C parity: an unaligned-start nonzero-prefix chunk runs
+                    // the incremental per-token state machine, not the batch
+                    // pool
+                    compressorPerToken(bb, il, pos0, 0, n, l.idxCompApe, ape16, l.idxCompNorm,
+                            idxDim, idxStateKv[il], idxStateScore[il], false,
+                            freqBase, freqScale, extFactor, attnFactor, nCtxOrig);
+                }
             } else if (zeroPrefix || !aligned) {
                 compressorPrefillBatch(bb, zeroPrefix, idxCompCache[il], idxStateKv[il], idxStateScore[il],
                         idxBefore, l.idxCompApe, ape16, l.idxCompNorm, idxDim, 4, pos0, n, false,
@@ -1564,7 +1612,12 @@ public final class Engine {
      * previous group as the pool's prev half), then norm/rope/(fp8+commit |
      * qat) finalize it and the state shifts cur->prev.
      */
-    void compressorPerToken(Metal.Batch bb, int il, int pos0, int n,
+    /** Tokens [t0, n) of the chunk (rows t0..n-1 of pfCompKv/pfCompSc at
+     *  positions pos0+t0..pos0+n-1): the incremental per-token state machine.
+     *  t0 = 0 processes the whole chunk; a nonzero t0 runs only the ragged
+     *  remainder after the aligned head was replay-batched (the remainder is
+     *  smaller than one pooling window, so it can only store state rows). */
+    void compressorPerToken(Metal.Batch bb, int il, int pos0, int t0, int n,
                             long apeOff, boolean ape16, long normOff, int headDim,
                             Metal.Buffer stateKv, Metal.Buffer stateSc, boolean mainComp,
                             float freqBase, float freqScale, float extFactor, float attnFactor, int nCtxOrig) {
@@ -1577,8 +1630,8 @@ public final class Engine {
         // encoding, so a shared mutated index scratch would be read with its
         // final content by every SET_ROWS
         Metal.Buffer slots = pfSlots.get(metal, (long) n * 4);
-        for (int t = 0; t < n; t++) slots.setInt((long) t * 4, 4 + ((pos0 + t) & 3));
-        for (int t = 0; t < n; t++) {
+        for (int t = t0; t < n; t++) slots.setInt((long) t * 4, 4 + ((pos0 + t) & 3));
+        for (int t = t0; t < n; t++) {
             int pos = pos0 + t;
             Tl.B slotIdx = Tl.B.b(slots, (long) t * 4);
             tl.launch(bb, tl.SET_ROWS_F32, ceilDiv(width, 1024), 1, 1,
